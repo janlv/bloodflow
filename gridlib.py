@@ -9,6 +9,27 @@ from numpy import array, ceil, sum as npsum, indices, delete, vstack, sqrt, mean
 #====================================================================================
 class Surface:
 #====================================================================================
+    """
+    Extract the pyvista surface from an STL-file 
+
+    Parameters
+        stl_file : str or Path
+            Path to the STL-file.
+
+        subdivide : int
+            Number of subdivisions. Each subdivision creates 4 new triangles, so the number 
+            of resulting triangles is nface*4**subdivide where nface is the current number 
+            of faces.
+        
+        subfilter : str, default: 'linear'
+            Can be one of the following:
+             - 'butterfly'
+             - 'loop'
+             - 'linear'
+        
+        progress_bar : bool, default: False
+            Display a progress bar for the subdivision routine.
+    """
     #--------------------------------------------------------------------------------
     def __init__(self, stl_file, subdivide=0, **kwargs) -> None:
     #--------------------------------------------------------------------------------
@@ -32,6 +53,9 @@ class Surface:
     #--------------------------------------------------------------------------------
     def line_segments(self):
     #--------------------------------------------------------------------------------
+        """
+        Return the lengths of all line segments of the surface as a numpy array
+        """
         ugrid = self.mesh.cast_to_unstructured_grid()
         connect = ugrid.cell_connectivity
         # Array of point-pairs that define a line
@@ -53,6 +77,26 @@ class Surface:
 #====================================================================================
 class Grid:
 #====================================================================================
+    """
+    Create a uniform grid from a Surface object
+
+    Parameters
+        surface : Surface
+            The surface the grid will be based on.
+
+        dx : float, default: None
+            Grid resolution. If None, dx is set to the mean line lengths of the surface
+
+        voxel : tuple of floats, default: (1,1,1)
+            Voxel size.
+        
+        wall : int, default 0
+            Add a layer of wall voxels around the geometry.
+
+        echo : bool, default: False
+            Notify on progress. 
+
+    """
     #--------------------------------------------------------------------------------
     def __init__(self, surface, dx=None, voxel=(1,1,1), wall=0, echo=False) -> None:
     #--------------------------------------------------------------------------------
@@ -91,12 +135,39 @@ class Grid:
                 f'  Size:  {self.size}')
 
     #--------------------------------------------------------------------------------
-    def create(self, threshold=0, method='cells', workers=1, **kwargs):
+    def create(self, threshold=0, coords='cells', workers=1, **kwargs):
     #--------------------------------------------------------------------------------
+        """
+        Generate the grid and add a distance scalar to each cell.
+        This scalar holds the shortest distance from the grid cell center 
+        to the surface cell center ('cells') or surface cell vertices ('points')
+        depending on the coords parameter. The distance scalar is positive 
+        inside the surface, and negative outside the surface.
+
+        Parameters
+            threshold : float, default: 0
+                Single min value or (min, max) to be used for the data threshold. 
+                Grid cell with a distance outside the threshold value is removed.
+            
+            invert : bool, default: False
+                Invert the threshold results. That is, cells that would have been in the 
+                output with this option off are excluded, while cells that would have been 
+                excluded from the output are included.
+            
+            coords : str, default: 'cells'
+                Can be one of the following:
+                - 'cells'  : distance to surface cell center
+                - 'points' : distance to surface cell vertices
+
+            workers : int, default: 1
+                Number of workers to use for parallel processing. If -1 is given 
+                all CPU threads are used.
+        """
         self.make_uniform_grid()
-        self.add_distance_map(coords=method, workers=workers)
-        # Remove grid-cells outside surface (negative values)
-        self.threshold(value=threshold)
+        # Distance is negative outside the surface
+        self.add_distance_map(coords=coords, workers=workers)
+        # Remove grid-cells with values less than threshold
+        self.threshold(value=threshold, **kwargs)
         if self.echo_on:
             print(self)
 
@@ -119,6 +190,10 @@ class Grid:
     #--------------------------------------------------------------------------------
     def save(self, path=None, **kwargs):
     #--------------------------------------------------------------------------------
+        """
+        Save grid as a VTK-file with the STL filename appended with the 
+        dimensions of the grid. Extension is '.vtk'
+        """
         path = Path(path or self.surface.stl)
         name = f"{path.stem}__{'x'.join(map(str, self.dim))}.vtk"
         path = path.with_name(name)
@@ -145,15 +220,21 @@ class Grid:
     #--------------------------------------------------------------------------------
     def threshold(self, value=0, **kwargs):
     #--------------------------------------------------------------------------------
-        # if invert:
-        #     value = (min(self.min), value)
+        """
+        Threshold the grid using the pyvista threshold filter. 
+        
+        See https://docs.pyvista.org/version/stable/api/core/_autosummary/pyvista.DataSetFilters.threshold.html
+        for details  
+        """
         self.grid = self.ugrid.threshold(value=value, scalars=self.distance, **kwargs)
-        #return self
 
     @echo('Creating uniform grid')
     #--------------------------------------------------------------------------------
     def make_uniform_grid(self):
     #--------------------------------------------------------------------------------
+        """
+        Create a uniform grid and add and the index matrix 'ijk'
+        """
         # Create uniform grid
         ugrid = ImageData()
         ugrid.spacing = self.voxel
@@ -166,7 +247,7 @@ class Grid:
 
     @echo('Calculating distance map')
     #--------------------------------------------------------------------------------
-    def add_distance_map(self, coords='cells', workers=1, name='distance', ):
+    def add_distance_map(self, coords='cells', workers=1):
     #--------------------------------------------------------------------------------
         """ 
         Add a distance map to the grid. It is the shortest distance from grid 
@@ -175,9 +256,9 @@ class Grid:
         'coords'  : Use surface cell centers ('cells'), or surface cell 
                     vertices ('points'), default is 'cells'
         'workers' : number of parallel processes, default is 1
-        'name'    : name of the distance map scalar, default is 'distance'
         """
-        self.distance = name
+        if coords not in ('points','cells'):
+            raise SyntaxError(f"ERROR in Grid: add_distance_map coords must be 'points' or 'cells', not '{coords}'")
         if coords == 'points':
             # Use points
             surf_coords = self.surface.points
@@ -186,8 +267,6 @@ class Grid:
             # Use cells
             surf_coords = self.surface.cell_centers().points
             surf_normals = self.surface.cell_normals
-        else:
-            raise SyntaxError(f"ERROR in Grid: add_distance_map coords must be 'points' or 'cells', not '{coords}'")
         _, idx = KDTree(surf_coords).query(self.ugrid.cells, workers=workers)
         norm_times_dist = surf_normals[idx] * (surf_coords[idx] - self.ugrid.cells)
         self.ugrid[self.distance] = npsum(norm_times_dist/self.voxel, axis=1)
