@@ -2,8 +2,7 @@ from pathlib import Path
 from itertools import pairwise, islice #, batched available in 3.12
 from pyvista import read as pvread, ImageData, Plotter
 from scipy.spatial import KDTree
-from numpy import array, ceil, sum as npsum, indices, delete, vstack, sqrt, mean
-
+from numpy import array, ceil, sum as npsum, indices, delete, vstack, sqrt, mean, stack
 
 
 #====================================================================================
@@ -102,15 +101,15 @@ class Grid:
     #--------------------------------------------------------------------------------
         self.surface = surface
         dx = dx or mean(surface.line_segments())
-        self.voxel = dx*array(voxel)
+        voxel = array(voxel)
+        self.voxel = dx*voxel
+        self.skin = 0.5*sqrt(2) # a node touch the surface if the distance less than this
         self.wall = wall
         self.echo_on = echo
         self.size = surface.max - surface.min + 2*self.wall*self.voxel
         self.dim = ceil(self.size/self.voxel).astype(int)
-        #self.center = [0.5*(a+b) for a,b in batched(surface.bounds, 2)]
         self.ugrid = None
         self.grid = None
-        self.distance = 'distance'
 
     #--------------------------------------------------------------------------------
     def __setitem__(self, key, value):
@@ -135,7 +134,7 @@ class Grid:
                 f'  Size:  {self.size}')
 
     #--------------------------------------------------------------------------------
-    def create(self, threshold=0, coords='cells', workers=1, **kwargs):
+    def create(self, threshold=None, coords='points', workers=1, **kwargs):
     #--------------------------------------------------------------------------------
         """
         Generate the grid and add a distance scalar to each cell.
@@ -145,7 +144,7 @@ class Grid:
         inside the surface, and negative outside the surface.
 
         Parameters
-            threshold : float, default: 0
+            threshold : float, default: -0.5*sqrt(2)
                 Single min value or (min, max) to be used for the data threshold. 
                 Grid cell with a distance outside the threshold value is removed.
             
@@ -154,20 +153,22 @@ class Grid:
                 output with this option off are excluded, while cells that would have been 
                 excluded from the output are included.
             
-            coords : str, default: 'cells'
-                Can be one of the following:
-                - 'cells'  : distance to surface cell center
-                - 'points' : distance to surface cell vertices
+            coords : str, default: 'points'
+                Distance from grid node center to:
+                - 'cells'  : surface cell center
+                - 'points' : surface cell vertices
 
             workers : int, default: 1
                 Number of workers to use for parallel processing. If -1 is given 
                 all CPU threads are used.
         """
+        if threshold is None:
+            threshold = -self.skin
         self.make_uniform_grid()
         # Distance is negative outside the surface
         self.add_distance_map(coords=coords, workers=workers)
         # Remove grid-cells with values less than threshold
-        self.threshold(value=threshold, **kwargs)
+        self.threshold_ugrid(value=threshold, **kwargs)
         if self.echo_on:
             print(self)
 
@@ -202,31 +203,74 @@ class Grid:
             print(f'  Saved {path}')
 
     #--------------------------------------------------------------------------------
-    def plot_mesh(self, surface=True, grid=False, show_edges=True, clip=False, **kwargs):
+    def _plot_data_(self, grid, pl=None, show_edges=True, clip=False, cmap='jet', **kwargs):
     #--------------------------------------------------------------------------------
-        pl = Plotter()
-        if surface:
-            pl.add_mesh(self.surface.mesh, show_edges=show_edges, opacity=0.7)
-        if grid:
-            pl.add_mesh(self.ugrid, show_edges=show_edges, opacity=0.7, **kwargs)
-        else:
-            data = self.grid
-            if clip:
-                data = self.grid.clip(clip)
-            pl.add_mesh(data, show_edges=show_edges, **kwargs)
-        pl.show()
+        show = False
+        if pl is None:
+            show = True
+            pl = Plotter()
+        if clip:
+            grid = grid.clip(clip)
+        pl.add_mesh(grid, show_edges=show_edges, cmap=cmap, **kwargs)
+        if show:
+            pl.show()
+        return pl, grid
+
+    #--------------------------------------------------------------------------------
+    def plot_grid(self, *args, wall=False, **kwargs):
+    #--------------------------------------------------------------------------------
+        grid = self.grid
+        if wall:
+            grid = self.grid.threshold(value=(-self.skin, self.skin), scalars='distance')
+        pl, grid = self._plot_data_(grid, *args, **kwargs)
+        if wall:
+            pl.add_lines(self.distance_lines(grid), color='cyan', width=3)
+        pl.update()
+        return pl
+
+    #--------------------------------------------------------------------------------
+    def plot_ugrid(self, *args, **kwargs):
+    #--------------------------------------------------------------------------------
+        pl, _ = self._plot_data_(self.ugrid, *args, **kwargs)
+        return pl
+
+    #--------------------------------------------------------------------------------
+    def plot_surface(self, *args, **kwargs):
+    #--------------------------------------------------------------------------------
+        pl, _ = self._plot_data_(self.surface.mesh, *args, **kwargs)
+        return pl
+
+    #--------------------------------------------------------------------------------
+    def distance_lines(self, grid=None):
+    #--------------------------------------------------------------------------------
+        """
+        Return an array of line segments holding start and end points. 
+        The start points (even indices) are the cell centers, and the 
+        end points (odd indices) all lie on the surface. The lines are 
+        parallel to the local normal vector of the surface.
+        """
+        if grid is None:
+            grid = self.grid
+        # Get distance vector scaled by the voxel resolution
+        dist_vec = grid['distance'].reshape(-1,1) * grid['normal'] * self.voxel
+        # Create array of line segments
+        A = grid.cell_centers().points
+        lines = stack((A,A), axis=1).reshape(-1,3)
+        # Add distance vector to get the end-point of the line
+        lines[1::2, :] += dist_vec
+        return lines
 
     @echo('Thresholding grid')
     #--------------------------------------------------------------------------------
-    def threshold(self, value=0, **kwargs):
+    def threshold_ugrid(self, value=0, **kwargs):
     #--------------------------------------------------------------------------------
         """
-        Threshold the grid using the pyvista threshold filter. 
+        Threshold the uniform grid using the pyvista threshold filter. 
         
         See https://docs.pyvista.org/version/stable/api/core/_autosummary/pyvista.DataSetFilters.threshold.html
         for details  
         """
-        self.grid = self.ugrid.threshold(value=value, scalars=self.distance, **kwargs)
+        self.grid = self.ugrid.threshold(value=value, scalars='distance', **kwargs)
 
     @echo('Creating uniform grid')
     #--------------------------------------------------------------------------------
@@ -267,9 +311,14 @@ class Grid:
             # Use cells
             surf_coords = self.surface.cell_centers().points
             surf_normals = self.surface.cell_normals
-        _, idx = KDTree(surf_coords).query(self.ugrid.cells, workers=workers)
-        norm_times_dist = surf_normals[idx] * (surf_coords[idx] - self.ugrid.cells)
-        self.ugrid[self.distance] = npsum(norm_times_dist/self.voxel, axis=1)
+        dist, idx = KDTree(surf_coords).query(self.ugrid.cells, workers=workers)
+        # KDTree gives the absolute distance from grid-cell to surface-cell.
+        # We need to know if the grid-cell is inside or outside the surface.
+        # Calculate dist-vector from surface and grid points
+        dist_vec = surf_coords[idx] - self.ugrid.cells
+        # Distance is the vector product of the surface normal and the distance vector
+        self.ugrid['distance'] = npsum((surf_normals[idx] * dist_vec)/self.voxel, axis=1)
+        self.ugrid['normal'] = surf_normals[idx]
 
     #--------------------------------------------------------------------------------
     def index(self):
