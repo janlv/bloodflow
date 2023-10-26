@@ -2,7 +2,7 @@ from pathlib import Path
 from itertools import pairwise, islice #, batched available in 3.12
 from pyvista import read as pvread, ImageData, Plotter
 from scipy.spatial import KDTree
-from numpy import array, ceil, sum as npsum, indices, delete, vstack, sqrt, mean, stack
+from numpy import array, ceil, sum as npsum, indices, delete, vstack, sqrt, mean, stack, uint8
 
 
 #====================================================================================
@@ -85,25 +85,33 @@ class Grid:
 
         dx : float, default: None
             Grid resolution. If None, dx is set to the mean line lengths of the surface
-
-        voxel : tuple of floats, default: (1,1,1)
-            Voxel size.
         
-        wall : int, default 0
+        wall : int, default: 0
             Add a layer of wall voxels around the geometry.
+
+        lattice : str, default: 'D3Q19'
+            Type of lattice to generate. The wall node criteria depends on the lenght of 
+            the lattice links connecting node centers.
+            Valid arguments: 'D2Q9', 'D3Q15', 'D3Q19', 'D3Q27'
 
         echo : bool, default: False
             Notify on progress. 
 
     """
     #--------------------------------------------------------------------------------
-    def __init__(self, surface, dx=None, voxel=(1,1,1), wall=0, echo=False) -> None:
+    def __init__(self, surface, dx=None, wall=2, lattice='D3Q19', echo=False) -> None:
     #--------------------------------------------------------------------------------
         self.surface = surface
         dx = dx or mean(surface.line_segments())
-        voxel = array(voxel)
-        self.voxel = dx*voxel
-        self.skin = 0.5*sqrt(2) # a node touch the surface if the distance less than this
+        self.voxel = dx*array((1,1,1))
+        latlen2 = {'D2Q9':2, 'D3Q19':2, 'D3Q15':3, 'D3Q27': 3}
+        try:
+            max_link = sqrt(latlen2[lattice.upper()])
+        except KeyError as err:
+            raise SyntaxError(
+                f'Unknown lattice: {lattice}. Valid lattices are {latlen2.keys()}'
+                ) from err
+        self.skin = (0.5+1e-8)*max_link # wall node if node-surface distance is less than skin
         self.wall = wall
         self.echo_on = echo
         self.size = surface.max - surface.min + 2*self.wall*self.voxel
@@ -134,7 +142,7 @@ class Grid:
                 f'  Size:  {self.size}')
 
     #--------------------------------------------------------------------------------
-    def create(self, threshold=None, coords='points', workers=1, **kwargs):
+    def create(self, coords='points', workers=1):
     #--------------------------------------------------------------------------------
         """
         Generate the grid and add a distance scalar to each cell.
@@ -144,15 +152,6 @@ class Grid:
         inside the surface, and negative outside the surface.
 
         Parameters
-            threshold : float, default: -0.5*sqrt(2)
-                Single min value or (min, max) to be used for the data threshold. 
-                Grid cell with a distance outside the threshold value is removed.
-            
-            invert : bool, default: False
-                Invert the threshold results. That is, cells that would have been in the 
-                output with this option off are excluded, while cells that would have been 
-                excluded from the output are included.
-            
             coords : str, default: 'points'
                 Distance from grid node center to:
                 - 'cells'  : surface cell center
@@ -162,13 +161,24 @@ class Grid:
                 Number of workers to use for parallel processing. If -1 is given 
                 all CPU threads are used.
         """
-        if threshold is None:
-            threshold = -self.skin
+        threshold = -(self.skin + self.wall)
         self.make_uniform_grid()
         # Distance is negative outside the surface
         self.add_distance_map(coords=coords, workers=workers)
         # Remove grid-cells with values less than threshold
-        self.threshold_ugrid(value=threshold, **kwargs)
+        self.threshold_ugrid(value=threshold)
+        # Add node type masks
+        # Wall nodes have links crossing the surface (boundary)
+        wall = (self.grid['distance'] > -self.skin) * (self.grid['distance'] < self.skin)
+        # Solid nodes lie outside of the wall nodes (negative distance)
+        solid = self.grid['distance'] < -self.skin
+        # Fluid modes lie inside of the wall nodes (positive distance)
+        fluid = self.grid['distance'] > self.skin
+        if npsum(wall * solid * fluid) > 0:
+            print('  WARNING! Overlapping fluid, wall or solid nodes!')
+        self.grid['wall'] = wall.astype(uint8)
+        self.grid['solid'] = solid.astype(uint8)
+        self.grid['fluid'] = fluid.astype(uint8)
         if self.echo_on:
             print(self)
 
@@ -221,7 +231,7 @@ class Grid:
     #--------------------------------------------------------------------------------
         grid = self.grid
         if wall:
-            grid = self.grid.threshold(value=(-self.skin, self.skin), scalars='distance')
+            grid = self.grid.threshold(value=1, scalars='wall')
         pl, grid = self._plot_data_(grid, *args, **kwargs)
         if wall:
             pl.add_lines(self.distance_lines(grid), color='cyan', width=3)
