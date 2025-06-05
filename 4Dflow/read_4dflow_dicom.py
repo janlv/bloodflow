@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 
 from itertools import groupby
-#from operator import attrgetter
 import sys
 from pathlib import Path
 import numpy as np
-import pydicom
+from pydicom import dcmread
 from tqdm import tqdm
-from pyvista import UniformGrid, read as pvread
+from pyvista import ImageData, read as pvread
 from scipy.spatial import KDTree
 
 #MAG = 3  # Number of the magnitude series
@@ -74,9 +73,11 @@ def main(path, stl_file=None, cut=None):
 #------------------------------------------------------------------
     MAG = 3  # Number of the magnitude series
 
-    ### Read dicom-files
-    print('  Reading dicom-files...')
-    dcm = [(pydicom.dcmread(f),f) for f in tqdm(list(path.rglob('*.dcm')))]
+    # Read dicom-files
+    filelist = list(path.rglob('*.dcm'))
+    dcmfiles = ((dcmread(f),f) for f in tqdm(filelist, desc='  Reading DICOM files', ncols=100))
+    # Remove files that are not valid dicom files
+    dcm = [d for d in dcmfiles if hasattr(d[0], 'SliceLocation')]
 
     print('  Processing data...')
     ### Group dicom by series number
@@ -101,25 +102,26 @@ def main(path, stl_file=None, cut=None):
     ### Adjust velocity pixel values
     print('  Adjusting velocity...')
     #venc = np.array((200, 200, 200)) # What is this? venc = velocity encoding 200 cm/s
-    venc = 150*np.ones(3) # What is this? venc = velocity encoding 150 cm/s
+    venc = 150 * np.ones(3) # What is this? venc = velocity encoding 150 cm/s
     level = 2**S0.HighBit-1
     pixels[:, :MAG, ...] = (pixels[:, :MAG, ...]-level) * venc[None, :, None, None, None] / level
 
     print('  Transforming data to RCS...')
-    ### Contruct 4x4 transformation matrix M
+    # RCS = Reference Coordinate System
+    # Contruct 4x4 transformation matrix M
     X, Y = np.split(np.array(S0.ImageOrientationPatient), 2) # pylint: disable=unbalanced-tuple-unpacking
     Z = np.cross(X, Y)
     IPP = np.array([s.ImagePositionPatient for s in S[0,0,:2]])
     shift = np.array(S[0,0,0].ImagePositionPatient)
     M = np.column_stack((X, Y, Z, shift))
     M = np.vstack((M,[0,0,0,1]))
-    ### Grid resolution
+    # Grid resolution
     IPP = np.array([s.ImagePositionPatient for s in S[0,0,:2]])
     (dx, dy), dz = S0.PixelSpacing, np.abs(np.dot(Z, IPP[1]-IPP[0]))
-    ### Create cell-data grid
-    grid = UniformGrid()
+    # Create cell-data grid
+    grid = ImageData()
     grid.origin = (0, 0, 0)
-    ### Note the interchange between x- and y-axis!!!
+    # Note the interchange between x- and y-axis!!!
     grid.dimensions = np.array([ny, nx, nz]) + 1
     grid.spacing = (dy, dx, dz)
     if cut:
@@ -132,14 +134,14 @@ def main(path, stl_file=None, cut=None):
         pixels[:,:,-bx or nx:,:,:] = -1 # need nx because [-0:] = whole array
         pixels[:,:,:,-by or ny:,:] = -1
         pixels[:,:,:,:,-bz or nz:] = -1
-    ### Interchange x- and y-axis and flatten last three dimensions
+    # Interchange x- and y-axis and flatten last three dimensions
     pixels = pixels.transpose(0,1,3,2,4).reshape(pixels.shape[:2] + (-1,), order='F')
-    ### Rotate grid using 4x4 rotation matrix M
+    # Rotate grid using 4x4 rotation matrix M
     grid = grid.transform(M, inplace=False)
 
     if stl_file:
         print(f'  Removing data outside vessels using {stl_file}...')
-        ### Use STL-file to remove data outside the blood vessels
+        # Use STL-file to remove data outside the blood vessels
         surface = pvread(stl_file).extract_surface()
         dist_map = distance_map(surface, grid)
         grid['distance'] = dist_map
@@ -149,16 +151,16 @@ def main(path, stl_file=None, cut=None):
     #     a, b, c = cut
     #     grid['cut'][a:-a,b:-b,c:-c] = 1
 
-    ### Write data as vtk cell-data
-    print('  Saving files...')
-    ### Loop over times
+    # Write data as vtk cell-data
+    #print('  Saving files...')
+    # Loop over times
     stl_str = '_'+Path(stl_file).stem if stl_file else ''
     cut_str = '_'+'x'.join(str(v) for v in cut) if cut else ''
     name = '4Dflow' + stl_str + cut_str
     vel_sum_2 = None
     with PVD_file(path/name) as pvd:
-        ### NB! The pixel arrays are already flattened for the x-, y-, and z-axis (reshape on line 62)
-        for i, series in tqdm(list(enumerate(pixels))):
+        # NB! The pixel arrays are already flattened for the x-, y-, and z-axis (reshape on line 62)
+        for i, series in tqdm(list(enumerate(pixels)), desc='  Writing VTK files', ncols=100):
             vtk = grid.copy()
             vtk.cell_data['magnitude'] = series[MAG]
             vtk.cell_data['velocity'] = np.transpose(np.vstack(series[:MAG]))
