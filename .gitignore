@@ -1,2 +1,13 @@
 *.vtk
 *.pyc
+.DS_Store
+IM*
+__pycache__/
+*.vtu
+*.vts
+*.pvd
+*.dcm
+DICOMDIR
+DIR_INFO.TXT
+*.png
+*.pptx
